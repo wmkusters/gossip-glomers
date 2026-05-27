@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -15,26 +17,52 @@ type BroadcastMsg struct {
 	Message   *int   `json:"message,omitempty"`
 }
 
+type TopologyMsg struct {
+	Type     string              `json:"type"`
+	Topology map[string][]string `json:"topology,omitempty"`
+}
+
 func main() {
-	msgs := []int{}
+	msgs := map[int]bool{}
+	ml := sync.Mutex{}
+	neighbors := []string{}
 	n := maelstrom.NewNode()
+
+	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		return nil
+	})
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		// Unmarshal the message body as an loosely-typed map.
-		var m BroadcastMsg
-		if err := json.Unmarshal(msg.Body, &m); err != nil {
+		var rx BroadcastMsg
+		if err := json.Unmarshal(msg.Body, &rx); err != nil {
 			return err
 		}
 
-		if m.Message == nil {
+		if rx.Message == nil {
 			return errors.New("nil message value in broadcast")
 		}
-		msgs = append(msgs, *m.Message)
+		ml.Lock()
+		defer ml.Unlock()
+		if _, ok := msgs[*rx.Message]; ok {
+			return nil
+		}
 
+		msgs[*rx.Message] = true
+		for _, neighbor := range neighbors {
+			err := n.Send(neighbor, BroadcastMsg{
+				Type:    "broadcast",
+				Message: rx.Message,
+			})
+			if err != nil {
+				return fmt.Errorf("got error sending message to neighbor: %w", err)
+			}
+		}
 		// Update the message type to return back.
-		m.Type = "broadcast_ok"
-		m.Message = nil
-		return n.Reply(msg, m)
+		rx.Type = "broadcast_ok"
+		rx.Message = nil
+		return n.Reply(msg, rx)
 	})
+
 	n.Handle("read", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as an loosely-typed map.
 		var body map[string]any
@@ -44,20 +72,28 @@ func main() {
 
 		// Update the message type to return back.
 		body["type"] = "read_ok"
-		body["messages"] = msgs
+		tx := []int{}
+		ml.Lock()
+		defer ml.Unlock()
+		for m := range msgs {
+			tx = append(tx, m)
+		}
+		body["messages"] = tx
 		return n.Reply(msg, body)
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
+		var m TopologyMsg
+		if err := json.Unmarshal(msg.Body, &m); err != nil {
 			return err
 		}
 
-		delete(body, "topology")
-		// Update the message type to return back.
-		body["type"] = "topology_ok"
-		return n.Reply(msg, body)
+		neighbors = m.Topology[n.ID()]
+		reply := TopologyMsg{
+			Type:     "topology_ok",
+			Topology: nil,
+		}
+		return n.Reply(msg, reply)
 	})
 
 	if err := n.Run(); err != nil {
