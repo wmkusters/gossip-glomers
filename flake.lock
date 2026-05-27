@@ -1,6 +1,6 @@
 {
   "nodes": {
-    "nixpkgs": {
+    "maelstromPinPkgs": {
       "locked": {
         "lastModified": 1732572230,
         "narHash": "sha256-AfpbEbTYLnF142lvX/bAovSRIYOXWaTTbP1+kR2Xi2w=",
@@ -16,8 +16,25 @@
         "type": "github"
       }
     },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1779560665,
+        "narHash": "sha256-tpyBcxPpcQb8ukyNF7DoCwfSY3VPsxHoYwj00Cayv5o=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "64c08a7ca051951c8eae34e3e3cb1e202fe36786",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
+        "maelstromPinPkgs": "maelstromPinPkgs",
         "nixpkgs": "nixpkgs"
       }
     }
