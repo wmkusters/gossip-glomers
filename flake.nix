@@ -40,6 +40,11 @@
           bin = "unique-id-generation";
           maelstromArgs = "-w unique-ids --time-limit 30 --rate 1000 --node-count 3 --availability total --nemesis partition";
         };
+        broadcast = {
+          subPackage = "broadcast";
+          bin = "broadcast";
+          maelstromArgs = "-w broadcast --time-limit 20 --rate 10 --node-count 1";
+        };
       };
     in
     {
