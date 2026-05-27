@@ -1,5 +1,5 @@
 {
-  description = "A very basic flake";
+  description = "Flake for maelstrom shell";
 
   inputs = {
     #nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-25.11";
@@ -11,7 +11,6 @@
     {
       self,
       nixpkgs,
-      nixpkgs-pinned,
     }:
     let
       systems = [
@@ -30,7 +29,7 @@
     {
       devShells = forEachSystem (pkgs: {
         default = pkgs.mkShell {
-          packages = [ pkgs.maelstrom ];
+          packages = [ pkgs.maelstrom-clj ];
         };
       });
     };
