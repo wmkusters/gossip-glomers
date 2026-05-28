@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -26,6 +27,8 @@ func main() {
 	msgs := map[int]bool{}
 	ml := sync.Mutex{}
 	neighbors := []string{}
+	outbound := map[string]map[int]bool{}
+	omu := sync.Mutex{}
 	n := maelstrom.NewNode()
 
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
@@ -48,14 +51,13 @@ func main() {
 		}
 
 		msgs[*rx.Message] = true
+		omu.Lock()
+		defer omu.Unlock()
 		for _, neighbor := range neighbors {
-			err := n.Send(neighbor, BroadcastMsg{
-				Type:    "broadcast",
-				Message: rx.Message,
-			})
-			if err != nil {
-				return fmt.Errorf("got error sending message to neighbor: %w", err)
+			if _, ok := outbound[neighbor]; !ok {
+				outbound[neighbor] = map[int]bool{}
 			}
+			outbound[neighbor][*rx.Message] = true
 		}
 		// Update the message type to return back.
 		rx.Type = "broadcast_ok"
@@ -96,8 +98,41 @@ func main() {
 		return n.Reply(msg, reply)
 	})
 
+	go func() {
+		for {
+			newOutbound := map[string]map[int]bool{}
+			omu.Lock()
+			for neighbor, ob := range outbound {
+				outbound[neighbor] = map[int]bool{}
+				for msg := range ob {
+					outbound[neighbor][msg] = true
+				}
+			}
+
+			for neighbor, ob := range outbound {
+				for msg := range ob {
+					err := n.RPC(neighbor, BroadcastMsg{
+						Type:    "broadcast",
+						Message: &msg,
+					}, func(mmsg maelstrom.Message) error {
+						log.Printf("callback handler called on node %s for msg: %d", n.ID(), msg)
+						if mmsg.RPCError() == nil {
+							delete(newOutbound[neighbor], msg)
+							return nil
+						}
+						return fmt.Errorf("rpc broadcast error on node %s for msg %d", n.ID(), msg)
+					})
+					if err != nil {
+						log.Printf("got error sending message to neighbor: %s", err)
+					}
+				}
+			}
+			omu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
-
 }
