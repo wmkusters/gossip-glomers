@@ -43,7 +43,7 @@
         broadcast = {
           subPackage = "broadcast";
           bin = "broadcast";
-          maelstromArgs = "-w broadcast --time-limit 20 --rate 10 --node-count 5 --nemesis partition";
+          maelstromArgs = "-w broadcast --time-limit 20 --rate 100 --node-count 25 --latency 100";
         };
       };
     in

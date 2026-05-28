@@ -24,12 +24,25 @@ type TopologyMsg struct {
 }
 
 func main() {
-	msgs := map[int]bool{}
-	ml := sync.Mutex{}
-	neighbors := []string{}
+	receivedMsgs := map[int]bool{}
+	dedupedMsgs := []int{}
+	rxMtx := sync.Mutex{}
+
+	// map[neighbor] -> messages that need confirmation
 	outbound := map[string]map[int]bool{}
-	omu := sync.Mutex{}
+	outboundMtx := sync.Mutex{}
+	// this node's neighbors, set by Topology
+	neighbors := []string{}
 	n := maelstrom.NewNode()
+
+	addToOutbound := func(neighbor string, msg int) {
+		outboundMtx.Lock()
+		if _, ok := outbound[neighbor]; !ok {
+			outbound[neighbor] = map[int]bool{}
+		}
+		outbound[neighbor][msg] = true
+		outboundMtx.Unlock()
+	}
 
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
 		return nil
@@ -44,20 +57,19 @@ func main() {
 		if rx.Message == nil {
 			return errors.New("nil message value in broadcast")
 		}
-		ml.Lock()
-		defer ml.Unlock()
-		if _, ok := msgs[*rx.Message]; ok {
-			return nil
+		rxMtx.Lock()
+		defer rxMtx.Unlock()
+		if _, ok := receivedMsgs[*rx.Message]; ok {
+			rx.Type = "broadcast_ok"
+			rx.Message = nil
+			return n.Reply(msg, rx)
 		}
 
-		msgs[*rx.Message] = true
-		omu.Lock()
-		defer omu.Unlock()
+		receivedMsgs[*rx.Message] = true
+		dedupedMsgs = append(dedupedMsgs, *rx.Message)
+		// stick this in a goroutine so we don't block responding
 		for _, neighbor := range neighbors {
-			if _, ok := outbound[neighbor]; !ok {
-				outbound[neighbor] = map[int]bool{}
-			}
-			outbound[neighbor][*rx.Message] = true
+			go addToOutbound(neighbor, *rx.Message)
 		}
 		// Update the message type to return back.
 		rx.Type = "broadcast_ok"
@@ -74,13 +86,7 @@ func main() {
 
 		// Update the message type to return back.
 		body["type"] = "read_ok"
-		tx := []int{}
-		ml.Lock()
-		defer ml.Unlock()
-		for m := range msgs {
-			tx = append(tx, m)
-		}
-		body["messages"] = tx
+		body["messages"] = dedupedMsgs
 		return n.Reply(msg, body)
 	})
 
@@ -98,10 +104,11 @@ func main() {
 		return n.Reply(msg, reply)
 	})
 
+	// outbound Tx loop
 	go func() {
 		for {
 			newOutbound := map[string]map[int]bool{}
-			omu.Lock()
+			outboundMtx.Lock()
 			for neighbor, ob := range outbound {
 				outbound[neighbor] = map[int]bool{}
 				for msg := range ob {
@@ -127,7 +134,7 @@ func main() {
 					}
 				}
 			}
-			omu.Unlock()
+			outboundMtx.Unlock()
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
