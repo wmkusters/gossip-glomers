@@ -23,13 +23,18 @@ type TopologyMsg struct {
 	Topology map[string][]string `json:"topology,omitempty"`
 }
 
+type OutboundBroadcast struct {
+	LastAttempted *time.Time
+	Msg           BroadcastMsg
+}
+
 func main() {
 	receivedMsgs := map[int]bool{}
 	dedupedMsgs := []int{}
 	rxMtx := sync.Mutex{}
 
 	// map[neighbor] -> messages that need confirmation
-	outbound := map[string]map[int]bool{}
+	outbound := map[string]map[int]OutboundBroadcast{}
 	outboundMtx := sync.Mutex{}
 	// this node's neighbors, set by Topology
 	neighbors := []string{}
@@ -38,9 +43,15 @@ func main() {
 	addToOutbound := func(neighbor string, msg int) {
 		outboundMtx.Lock()
 		if _, ok := outbound[neighbor]; !ok {
-			outbound[neighbor] = map[int]bool{}
+			outbound[neighbor] = map[int]OutboundBroadcast{}
 		}
-		outbound[neighbor][msg] = true
+		outbound[neighbor][msg] = OutboundBroadcast{
+			LastAttempted: nil,
+			Msg: BroadcastMsg{
+				Type:    "broadcast",
+				Message: &msg,
+			},
+		}
 		outboundMtx.Unlock()
 	}
 
@@ -107,24 +118,21 @@ func main() {
 	// outbound Tx loop
 	go func() {
 		for {
-			newOutbound := map[string]map[int]bool{}
 			outboundMtx.Lock()
-			for neighbor, ob := range outbound {
-				outbound[neighbor] = map[int]bool{}
-				for msg := range ob {
-					outbound[neighbor][msg] = true
-				}
-			}
-
-			for neighbor, ob := range outbound {
-				for msg := range ob {
-					err := n.RPC(neighbor, BroadcastMsg{
-						Type:    "broadcast",
-						Message: &msg,
-					}, func(mmsg maelstrom.Message) error {
+			for neighbor, obs := range outbound {
+				for msg, ob := range obs {
+					if ob.LastAttempted != nil && ob.LastAttempted.Add(10*time.Millisecond).Before(time.Now()) {
+						log.Printf("not retrying message with value %d yet from node %s\n", *ob.Msg.Message, n.ID())
+						continue
+					}
+					t := time.Now()
+					ob.LastAttempted = &t
+					err := n.RPC(neighbor, ob.Msg, func(mmsg maelstrom.Message) error {
 						log.Printf("callback handler called on node %s for msg: %d", n.ID(), msg)
 						if mmsg.RPCError() == nil {
-							delete(newOutbound[neighbor], msg)
+							outboundMtx.Lock()
+							defer outboundMtx.Unlock()
+							delete(outbound[neighbor], msg)
 							return nil
 						}
 						return fmt.Errorf("rpc broadcast error on node %s for msg %d", n.ID(), msg)
@@ -132,10 +140,11 @@ func main() {
 					if err != nil {
 						log.Printf("got error sending message to neighbor: %s", err)
 					}
+					outbound[neighbor][msg] = ob
 				}
 			}
 			outboundMtx.Unlock()
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 
