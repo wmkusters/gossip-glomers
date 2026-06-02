@@ -12,11 +12,14 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+const BundleSize = 10
+
 type BroadcastMsg struct {
 	Type      string `json:"type"`
 	MsgID     int    `json:"msg_id"`
 	InReplyTo int    `json:"in_reply_to,omitempty"`
 	Message   *int   `json:"message,omitempty"`
+	Messages  *[]int `json:"messages,omitempty"`
 }
 
 type TopologyMsg struct {
@@ -37,7 +40,7 @@ type NeighborMap struct {
 
 type Neighbor struct {
 	ID     string
-	Needed map[int]OutboundBroadcast
+	Needed []OutboundBroadcast
 }
 
 func (ob OutboundBroadcast) ShouldTry() bool {
@@ -60,12 +63,31 @@ func main() {
 	n := maelstrom.NewNode()
 
 	addToOutbound := func(nid string, msg int) {
-		nm.Neighbors[nid].Needed[msg] = OutboundBroadcast{
+		outbound := nm.Neighbors[nid].Needed
+		ob := OutboundBroadcast{
 			LastAttempted: nil,
+			Attempts:      0,
 			Msg: BroadcastMsg{
-				Type:    "broadcast",
-				Message: &msg,
+				Type:     "broadcast",
+				Messages: &[]int{},
 			},
+		}
+		if len(outbound) == 0 ||
+			(outbound[len(outbound)-1].Msg.Messages != nil && len(*outbound[len(outbound)-1].Msg.Messages) < BundleSize) {
+			outbound = append(outbound, ob)
+		} else {
+			ob = outbound[len(outbound)-1]
+		}
+		new := []int{}
+		if ob.Msg.Messages != nil {
+			new = *ob.Msg.Messages
+		}
+		new = append(new, msg)
+		ob.Msg.Messages = &new
+		outbound[len(outbound)-1] = ob
+		nm.Neighbors[nid] = Neighbor{
+			ID:     nid,
+			Needed: outbound,
 		}
 	}
 
@@ -139,7 +161,7 @@ func main() {
 		for _, neighbor := range m.Topology[n.ID()] {
 			nm.Neighbors[neighbor] = Neighbor{
 				ID:     neighbor,
-				Needed: map[int]OutboundBroadcast{},
+				Needed: []OutboundBroadcast{},
 			}
 		}
 		reply := TopologyMsg{
@@ -158,10 +180,10 @@ func main() {
 		for {
 			nm.Lock.Lock()
 			for _, neighbor := range nm.Neighbors {
-				for msg, ob := range neighbor.Needed {
-					log.Printf("considering sending message with value %d to neighbor %s\n", msg, neighbor.ID)
+				for _, ob := range neighbor.Needed {
+					log.Printf("considering sending message with id %d to neighbor %s\n", ob.Msg.MsgID, neighbor.ID)
 					if !ob.ShouldTry() {
-						log.Printf("not retrying message with value %d yet from node %s\n", *ob.Msg.Message, n.ID())
+						log.Printf("not retrying message with id %d yet from node %s\n", ob.Msg.MsgID, n.ID())
 						continue
 					}
 					t := time.Now()
@@ -171,15 +193,30 @@ func main() {
 						if mmsg.RPCError() == nil {
 							nm.Lock.Lock()
 							defer nm.Lock.Unlock()
-							delete(nm.Neighbors[neighbor.ID].Needed, msg)
+							var j *int
+							for idx, nmsg := range neighbor.Needed {
+								var b maelstrom.MessageBody
+								err := json.Unmarshal(mmsg.Body, &b)
+								if err != nil {
+									return err
+								}
+								if nmsg.Msg.MsgID == b.InReplyTo {
+									j = &idx
+								}
+							}
+							if j != nil {
+								nm.Neighbors[neighbor.ID] = Neighbor{
+									ID:     neighbor.ID,
+									Needed: append(nm.Neighbors[neighbor.ID].Needed[:*j], nm.Neighbors[neighbor.ID].Needed[*j+1:]...),
+								}
+							}
 							return nil
 						}
-						return fmt.Errorf("rpc broadcast error on node %s for msg %d", n.ID(), msg)
+						return fmt.Errorf("rpc broadcast error on node %s for msg %d", n.ID(), ob.Msg.MsgID)
 					})
 					if err != nil {
 						log.Printf("got error sending message to neighbor: %s", err)
 					}
-					neighbor.Needed[msg] = ob
 				}
 			}
 			nm.Lock.Unlock()
