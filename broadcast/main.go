@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -25,7 +26,28 @@ type TopologyMsg struct {
 
 type OutboundBroadcast struct {
 	LastAttempted *time.Time
+	Attempts      int
 	Msg           BroadcastMsg
+}
+
+type NeighborMap struct {
+	Lock      sync.Mutex
+	Neighbors map[string]Neighbor
+}
+
+type Neighbor struct {
+	ID     string
+	Needed map[int]OutboundBroadcast
+}
+
+func (ob OutboundBroadcast) ShouldTry() bool {
+	if ob.LastAttempted == nil {
+		return true
+	}
+	// exponentially backoff on retries but start with a high initial wait period to account for injected latency
+	ms := int(math.Exp2(float64(ob.Attempts + 7)))
+	nextTry := (*ob.LastAttempted).Add(time.Duration(ms) * time.Millisecond)
+	return time.Now().After(nextTry)
 }
 
 func main() {
@@ -33,26 +55,18 @@ func main() {
 	dedupedMsgs := []int{}
 	rxMtx := sync.Mutex{}
 
-	// map[neighbor] -> messages that need confirmation
-	outbound := map[string]map[int]OutboundBroadcast{}
-	outboundMtx := sync.Mutex{}
-	// this node's neighbors, set by Topology
-	neighbors := []string{}
+	var nm NeighborMap
+
 	n := maelstrom.NewNode()
 
-	addToOutbound := func(neighbor string, msg int) {
-		outboundMtx.Lock()
-		if _, ok := outbound[neighbor]; !ok {
-			outbound[neighbor] = map[int]OutboundBroadcast{}
-		}
-		outbound[neighbor][msg] = OutboundBroadcast{
+	addToOutbound := func(nid string, msg int) {
+		nm.Neighbors[nid].Needed[msg] = OutboundBroadcast{
 			LastAttempted: nil,
 			Msg: BroadcastMsg{
 				Type:    "broadcast",
 				Message: &msg,
 			},
 		}
-		outboundMtx.Unlock()
 	}
 
 	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
@@ -79,9 +93,15 @@ func main() {
 		receivedMsgs[*rx.Message] = true
 		dedupedMsgs = append(dedupedMsgs, *rx.Message)
 		// stick this in a goroutine so we don't block responding
-		for _, neighbor := range neighbors {
-			go addToOutbound(neighbor, *rx.Message)
+		nm.Lock.Lock()
+		for _, neighbor := range nm.Neighbors {
+			if neighbor.ID == msg.Src {
+				continue
+			}
+			addToOutbound(neighbor.ID, *rx.Message)
 		}
+		nm.Lock.Unlock()
+
 		// Update the message type to return back.
 		rx.Type = "broadcast_ok"
 		rx.Message = nil
@@ -97,6 +117,8 @@ func main() {
 
 		// Update the message type to return back.
 		body["type"] = "read_ok"
+		rxMtx.Lock()
+		defer rxMtx.Unlock()
 		body["messages"] = dedupedMsgs
 		return n.Reply(msg, body)
 	})
@@ -107,7 +129,19 @@ func main() {
 			return err
 		}
 
-		neighbors = m.Topology[n.ID()]
+		if _, ok := m.Topology[n.ID()]; !ok {
+			panic("can't find self in topology")
+		}
+		nm = NeighborMap{
+			Lock:      sync.Mutex{},
+			Neighbors: map[string]Neighbor{},
+		}
+		for _, neighbor := range m.Topology[n.ID()] {
+			nm.Neighbors[neighbor] = Neighbor{
+				ID:     neighbor,
+				Needed: map[int]OutboundBroadcast{},
+			}
+		}
 		reply := TopologyMsg{
 			Type:     "topology_ok",
 			Topology: nil,
@@ -115,24 +149,29 @@ func main() {
 		return n.Reply(msg, reply)
 	})
 
+	type readBody struct {
+		Messages []int `json:"messages,omitempty"`
+	}
+
 	// outbound Tx loop
 	go func() {
 		for {
-			outboundMtx.Lock()
-			for neighbor, obs := range outbound {
-				for msg, ob := range obs {
-					if ob.LastAttempted != nil && ob.LastAttempted.Add(10*time.Millisecond).Before(time.Now()) {
+			nm.Lock.Lock()
+			for _, neighbor := range nm.Neighbors {
+				for msg, ob := range neighbor.Needed {
+					log.Printf("considering sending message with value %d to neighbor %s\n", msg, neighbor.ID)
+					if !ob.ShouldTry() {
 						log.Printf("not retrying message with value %d yet from node %s\n", *ob.Msg.Message, n.ID())
 						continue
 					}
 					t := time.Now()
 					ob.LastAttempted = &t
-					err := n.RPC(neighbor, ob.Msg, func(mmsg maelstrom.Message) error {
-						log.Printf("callback handler called on node %s for msg: %d", n.ID(), msg)
+					ob.Attempts++
+					err := n.RPC(neighbor.ID, ob.Msg, func(mmsg maelstrom.Message) error {
 						if mmsg.RPCError() == nil {
-							outboundMtx.Lock()
-							defer outboundMtx.Unlock()
-							delete(outbound[neighbor], msg)
+							nm.Lock.Lock()
+							defer nm.Lock.Unlock()
+							delete(nm.Neighbors[neighbor.ID].Needed, msg)
 							return nil
 						}
 						return fmt.Errorf("rpc broadcast error on node %s for msg %d", n.ID(), msg)
@@ -140,10 +179,10 @@ func main() {
 					if err != nil {
 						log.Printf("got error sending message to neighbor: %s", err)
 					}
-					outbound[neighbor][msg] = ob
+					neighbor.Needed[msg] = ob
 				}
 			}
-			outboundMtx.Unlock()
+			nm.Lock.Unlock()
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
