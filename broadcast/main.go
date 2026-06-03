@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
+	"maps"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -39,8 +40,9 @@ type NeighborMap struct {
 }
 
 type Neighbor struct {
-	ID     string
-	Needed []OutboundBroadcast
+	ID       string
+	Outbound []int
+	Pending  []OutboundBroadcast
 }
 
 func (ob OutboundBroadcast) ShouldTry() bool {
@@ -55,14 +57,17 @@ func (ob OutboundBroadcast) ShouldTry() bool {
 
 func main() {
 	receivedMsgs := map[int]bool{}
-	dedupedMsgs := []int{}
 	rxMtx := sync.Mutex{}
 
 	var nm NeighborMap
 
 	n := maelstrom.NewNode()
 
+	// addToOutbound will add a new message to a neighbor's outbound messages
+	// IT EXPECTS TO BE CALLED WHILE HOLDING THE LOCK.
 	addToOutbound := func(nid string, msg int) {
+		nm.Lock.Lock()
+		defer nm.Lock.Unlock()
 		outbound := nm.Neighbors[nid].Needed
 		ob := OutboundBroadcast{
 			LastAttempted: nil,
@@ -73,7 +78,7 @@ func main() {
 			},
 		}
 		if len(outbound) == 0 ||
-			(outbound[len(outbound)-1].Msg.Messages != nil && len(*outbound[len(outbound)-1].Msg.Messages) < BundleSize) {
+			(outbound[len(outbound)-1].Msg.Messages != nil && len(*outbound[len(outbound)-1].Msg.Messages) >= BundleSize) {
 			outbound = append(outbound, ob)
 		} else {
 			ob = outbound[len(outbound)-1]
@@ -101,28 +106,43 @@ func main() {
 			return err
 		}
 
-		if rx.Message == nil {
-			return errors.New("nil message value in broadcast")
+		if rx.Message == nil && rx.Messages == nil {
+			return errors.New("no message found in broadcast")
 		}
 		rxMtx.Lock()
 		defer rxMtx.Unlock()
-		if _, ok := receivedMsgs[*rx.Message]; ok {
-			rx.Type = "broadcast_ok"
-			rx.Message = nil
-			return n.Reply(msg, rx)
+		newMsgs := []int{}
+		if rx.Messages != nil {
+			for _, m := range *rx.Messages {
+				if _, ok := receivedMsgs[m]; ok {
+					continue
+				}
+				newMsgs = append(newMsgs, m)
+			}
 		}
 
-		receivedMsgs[*rx.Message] = true
-		dedupedMsgs = append(dedupedMsgs, *rx.Message)
-		// stick this in a goroutine so we don't block responding
-		nm.Lock.Lock()
+		if rx.Message != nil {
+			if _, ok := receivedMsgs[*rx.Message]; ok {
+				rx.Type = "broadcast_ok"
+				rx.Message = nil
+				rx.Messages = nil
+				return n.Reply(msg, rx)
+			}
+			newMsgs = append(newMsgs, *rx.Message)
+		}
+
+		for _, nm := range newMsgs {
+			receivedMsgs[nm] = true
+		}
+
 		for _, neighbor := range nm.Neighbors {
 			if neighbor.ID == msg.Src {
 				continue
 			}
-			addToOutbound(neighbor.ID, *rx.Message)
+			for _, nm := range newMsgs {
+				addToOutbound(neighbor.ID, nm)
+			}
 		}
-		nm.Lock.Unlock()
 
 		// Update the message type to return back.
 		rx.Type = "broadcast_ok"
@@ -141,7 +161,7 @@ func main() {
 		body["type"] = "read_ok"
 		rxMtx.Lock()
 		defer rxMtx.Unlock()
-		body["messages"] = dedupedMsgs
+		body["messages"] = slices.Collect(maps.Keys(receivedMsgs))
 		return n.Reply(msg, body)
 	})
 
@@ -180,42 +200,47 @@ func main() {
 		for {
 			nm.Lock.Lock()
 			for _, neighbor := range nm.Neighbors {
-				for _, ob := range neighbor.Needed {
-					log.Printf("considering sending message with id %d to neighbor %s\n", ob.Msg.MsgID, neighbor.ID)
-					if !ob.ShouldTry() {
-						log.Printf("not retrying message with id %d yet from node %s\n", ob.Msg.MsgID, n.ID())
-						continue
-					}
-					t := time.Now()
-					ob.LastAttempted = &t
-					ob.Attempts++
-					err := n.RPC(neighbor.ID, ob.Msg, func(mmsg maelstrom.Message) error {
-						if mmsg.RPCError() == nil {
-							nm.Lock.Lock()
-							defer nm.Lock.Unlock()
-							var j *int
-							for idx, nmsg := range neighbor.Needed {
-								var b maelstrom.MessageBody
-								err := json.Unmarshal(mmsg.Body, &b)
-								if err != nil {
-									return err
-								}
-								if nmsg.Msg.MsgID == b.InReplyTo {
-									j = &idx
-								}
-							}
-							if j != nil {
-								nm.Neighbors[neighbor.ID] = Neighbor{
-									ID:     neighbor.ID,
-									Needed: append(nm.Neighbors[neighbor.ID].Needed[:*j], nm.Neighbors[neighbor.ID].Needed[*j+1:]...),
+				ob := OutboundBroadcast{
+					LastAttempted: nil,
+					Attempts:      0,
+					Msg: BroadcastMsg{
+						Type:     "broadcast",
+						Messages: &neighbor.Outbound,
+					},
+				}
+				pending := nm.Neighbors[neighbor.ID].Pending
+				nm.Neighbors[neighbor.ID] = Neighbor{
+					ID:       neighbor.ID,
+					Outbound: []int{},
+					Pending:  append(pending, ob),
+				}
+				for i, p := range pending {
+					if p.ShouldTry() {
+						t := time.Now()
+						p.LastAttempted = &t
+						p.Attempts++
+						err := n.RPC(neighbor.ID, ob.Msg, func(mmsg maelstrom.Message) error {
+							if mmsg.RPCError() == nil {
+								nm.Lock.Lock()
+								defer nm.Lock.Unlock()
+								for j, sent := range nm.Neighbors[mmsg.Src].Pending {
+									if slices.Equal(*sent.Msg.Messages, *ob.Msg.Messages) {
+										old := nm.Neighbors[mmsg.Src].Pending
+										nm.Neighbors[mmsg.Src] = Neighbor{
+											ID:       mmsg.Src,
+											Outbound: nm.Neighbors[mmsg.Src].Outbound,
+											Pending:  append(old[:j], old[j+1:]...),
+										}
+									}
 								}
 							}
 							return nil
+						})
+						if err != nil {
+							log.Printf("got error sending message: %s\n", err)
+							continue
 						}
-						return fmt.Errorf("rpc broadcast error on node %s for msg %d", n.ID(), ob.Msg.MsgID)
-					})
-					if err != nil {
-						log.Printf("got error sending message to neighbor: %s", err)
+						pending[i] = p
 					}
 				}
 			}
